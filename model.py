@@ -152,8 +152,7 @@ def fit_model(
         factor=scheduler_factor,
         patience=scheduler_patience,
         threshold=scheduler_threshold,
-        threshold_mode='abs',
-        verbose=verbose
+        threshold_mode='abs'
     )
 
     hist = []
@@ -504,8 +503,7 @@ class ScalingLawFixedEffects:
             factor=scheduler_factor,
             patience=scheduler_patience,
             threshold=scheduler_threshold,
-            threshold_mode='abs',
-            verbose=verbose
+            threshold_mode='abs'
         )
     
         hist = []
@@ -803,8 +801,7 @@ def GetAsymptVar(X, Y, D, C, model, K,
             factor=.999,
             patience=10,
             threshold=0,
-            threshold_mode='abs',
-            verbose=False
+            threshold_mode='abs'
         )
     grads = []
     losses = []
@@ -862,144 +859,6 @@ def GetAsymptVar(X, Y, D, C, model, K,
  [{'min_eigenvalue':np.min(torch.linalg.eig(V2).eigenvalues.cpu().numpy().astype(float)),'V':V2.detach().cpu().numpy()},{name+"_ste":np.sqrt(x.detach().cpu().numpy()) for x,name in zip(unpack_theta(torch.diag(V2), param_shapes), ['beta', 'lambd1', 'lambd2', 'b', 'phi', 'sigma_lt'])}],
  [{'min_eigenvalue':np.min(torch.linalg.eig(V3).eigenvalues.cpu().numpy().astype(float)),'V':V3.detach().cpu().numpy()},{name+"_ste":np.sqrt(x.detach().cpu().numpy()) for x,name in zip(unpack_theta(torch.diag(V3), param_shapes), ['beta', 'lambd1', 'lambd2', 'b', 'phi', 'sigma_lt'])}]]
     
-"""
-def GetAsymptVar(Xs, Ys, Ds, Cs, models, j, K,
-                 device = 'cuda',
-                 B = 25000,
-                 lr = 1e-4,
-                 grad_tol = 1e-3,
-                 n_epochs = 100000,
-                 random_seed=42):
-    
-    norm_dist = MultivariateNormal(torch.zeros(K), torch.eye(K))
-    torch.manual_seed(random_seed)
-    Z = norm_dist.sample(sample_shape=(B,)).to(device).double()
-    beta = torch.tensor(models[j][K].beta,
-                        device=device,
-                        dtype=torch.float64,
-                        requires_grad=True)
-    lambd1 = torch.tensor(np.diag(models[j][K].lambd[:,:K]),
-                          device=device,
-                          dtype=torch.float64,
-                          requires_grad=True)
-    lambd2 = torch.tensor(models[j][K].lambd[:,K:],
-                          device=device,
-                          dtype=torch.float64,
-                          requires_grad=True)
-    b = torch.tensor(models[j][K].b,
-                     device=device,
-                     dtype=torch.float64,
-                     requires_grad=True)
-    phi = torch.tensor(models[j][K].phi,
-                       device=device,
-                       dtype=torch.float64,
-                       requires_grad=True)
-    sigma_lt = torch.tensor(extract_lower_triangle(torch.tensor(models[j][K].sigma)).clone().detach().numpy(),
-                            device=device,
-                            dtype=torch.float64,
-                            requires_grad=True)
-    param_shapes = (beta.shape, lambd1.shape, lambd2.shape, b.shape, phi.shape, sigma_lt.shape)
-
-    def loss_from_theta(theta, Z=Z, jac=False, device=device):
-        beta_new, lambd1_new, lambd2_new, b_new, phi_new, sigma_lt_new = unpack_theta(theta, param_shapes)
-        lt = torch.linalg.cholesky(reconstruct_corr_matrix(sigma_lt_new))
-        mask = torch.tril(torch.ones_like(lt)).bool()
-        L_new = -lt[mask]
-        lambd_new = torch.hstack((torch.diag(lambd1_new), lambd2_new))
-        loss = log_like(torch.tensor(Xs[j]).to(device).double(),
-                         torch.tensor(Ys[j]).to(device).double(),
-                         torch.tensor(Ds[j]).to(device).double(),
-                         torch.tensor(Cs[j]).to(device).double(),
-                         beta_new,
-                         lambd_new,
-                         b_new,
-                         phi_new,
-                         L_new,
-                         K,
-                         Z,
-                         agg=not jac)
-        if jac:
-            return loss
-        else:
-            return -loss
-
-    ## Fine-tuning
-    parameters = [sigma_lt, lambd1, lambd2, phi, b, beta]
-    optimizer = Adam([
-        {'params': sigma_lt, 'lr': lr},
-        {'params': lambd1,    'lr': lr},
-        {'params': lambd2,    'lr': lr},
-        {'params': phi,       'lr': 10*lr},
-        {'params': b,         'lr': lr},
-        {'params': beta,      'lr': lr}
-    ])
-    
-    scheduler  = ReduceLROnPlateau(
-            optimizer,
-            mode='min',
-            factor=.999,
-            patience=10,
-            threshold=0,
-            threshold_mode='abs',
-            verbose=False
-        )
-    grads = []
-    losses = []
-    for ep in tqdm(range(n_epochs), desc='fine-tuning'):
-        optimizer.zero_grad()
-        theta = pack_theta(beta, lambd1, lambd2, b, phi, sigma_lt)
-        loss = loss_from_theta(theta)
-        loss.backward()
-        losses.append(loss.item())
-        
-        # Compute gradient norm
-        total_grad = torch.sqrt(sum((p.grad**2).sum() for p in parameters)).item()
-        grads.append(total_grad)
-        if ep%1000==0:
-            print("grad norm:",grads[-1])
-        if grads[-1]<grad_tol:
-            break
-        optimizer.step()
-        scheduler.step(loss.item())
-    
-    plt.plot(losses)
-    plt.ylabel('loss')
-    plt.show()
-    
-    plt.plot(grads)
-    plt.ylabel('grad')
-    plt.yscale('log')
-    plt.show()
-
-    ## Computing variance
-    device = 'cpu'
-    beta = beta.cpu()
-    lambd1 = lambd1.cpu()
-    lambd2 = lambd2.cpu()
-    b = b.cpu()
-    phi = phi.cpu()
-    sigma_lt = sigma_lt.cpu()
-    Z = Z.cpu()
-    theta = pack_theta(beta, lambd1, lambd2, b, phi, sigma_lt)
-    def loss_from_theta2(theta):
-        return loss_from_theta(theta, Z=Z, device=device)
-    def loss_from_theta3(theta):
-        return loss_from_theta(theta, Z=Z, jac=True, device=device)
-        
-    H = hessian(loss_from_theta2, theta)
-    H = (H+H.T)/2
-    J = jacobian(loss_from_theta3, theta)
-
-    V = torch.linalg.inv(H)
-    V2 = torch.linalg.inv((J.T@J))
-    V3 = torch.linalg.inv((H + J.T@J)/2)
-
-    ## Output
-    return [[{'min_eigenvalue':np.min(torch.linalg.eig(V).eigenvalues.cpu().numpy().astype(float)),'H':H.detach().cpu().numpy(),'V':V.detach().cpu().numpy()},{name+"_ste":np.sqrt(x.detach().cpu().numpy()) for x,name in zip(unpack_theta(torch.diag(V), param_shapes), ['beta', 'lambd1', 'lambd2', 'b', 'phi', 'sigma_lt'])}],
- [{'min_eigenvalue':np.min(torch.linalg.eig(V2).eigenvalues.cpu().numpy().astype(float)),'V':V2.detach().cpu().numpy()},{name+"_ste":np.sqrt(x.detach().cpu().numpy()) for x,name in zip(unpack_theta(torch.diag(V2), param_shapes), ['beta', 'lambd1', 'lambd2', 'b', 'phi', 'sigma_lt'])}],
- [{'min_eigenvalue':np.min(torch.linalg.eig(V3).eigenvalues.cpu().numpy().astype(float)),'V':V3.detach().cpu().numpy()},{name+"_ste":np.sqrt(x.detach().cpu().numpy()) for x,name in zip(unpack_theta(torch.diag(V3), param_shapes), ['beta', 'lambd1', 'lambd2', 'b', 'phi', 'sigma_lt'])}]]
-"""
-
 def SampleParams(beta, b, phi, lambd1, lambd2, sigma, cov, n=100):
     sigma_lt = extract_lower_triangle(sigma)
     mu = pack_theta(torch.tensor(beta), torch.tensor(lambd1), torch.tensor(lambd2), torch.tensor(b), torch.tensor(phi), torch.tensor(sigma_lt)).numpy()

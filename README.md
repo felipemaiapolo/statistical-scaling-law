@@ -13,7 +13,7 @@ This repository contains the code and data that accompany the paper described in
 
 ## Getting started
 
-1. **Install dependencies** (Python 3.10+ recommended):
+1. **Install dependencies** (Python 3.13.12 recommended):
    ```bash
    pip install torch numpy pandas matplotlib seaborn tqdm joblib
    ```
