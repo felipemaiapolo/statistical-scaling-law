@@ -92,3 +92,10 @@ Y_names = {}
 Y_names[0] = ['math','ifeval','hellaswag','bbh','mmlu-pro','mmlu','arc','truthfulqa','gsm8k','winogrande','gpqa','musr']
 Y_names[1] = ['gsm8k','truthfulqa','hellaswag','mmlu','arc','winogrande']
 Y_names[2] = ['math','ifeval','bbh','mmlu-pro','gpqa','musr']
+
+B = 10000
+lrs = [.1,.05,.01]
+scheduler_factors = [.999,.99]
+reps = 5
+n_epochs = 20000
+random_seed = 42
