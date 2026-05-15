@@ -44,6 +44,7 @@ def log_like(
     K: int,
     Z: torch.Tensor = None,
     B: int = 100000,
+    eps: float = 1e-6,
     device: str = 'cpu',
     random_seed = 42,
     agg=True
@@ -60,9 +61,10 @@ def log_like(
 
     A = Z @ ch(L).T
     logits = (X @ beta)[None, :, :] + A[:, None, :]
-    logits = torch.clamp(logits @ lambd + b[None, :], min=-4.5, max=4.5)
+    logits = logits @ lambd + b[None, :]
 
     mu = C[None, :] + (1 - C[None, :]) * sigmoid(logits)
+    mu = mu.clamp(min=eps, max=1.0 - eps)      
     beta_dist = Beta(phi[None, :] * mu, phi[None, :] * (1 - mu))
 
     nan_mask = torch.isnan(Y) #dealing with missing values
@@ -218,7 +220,7 @@ def fit_model(
             L.data = L.data[torch.tril(torch.ones_like(L)).bool()]
 
             # Enforce non-negativity
-            phi.clamp_(min=0)
+            phi.clamp_(min=1e-6)
             lambd1.clamp_(min=0)
 
     # Finalize best parameters
@@ -289,7 +291,86 @@ class ScalingLaw:
         self.phi = None
         self.lambd1 = None
         self.lambd2 = None
-   
+
+    def fit_parallel(self,
+          X,
+          Y,
+          D,
+          C,
+          fe_start = False, 
+          reps = 10,
+          B = 5000, #initial MC samples
+          B_frequency = 1,
+          lrs = [.05,.01,.005], 
+          scheduler_factors = [.99],  # Decay factor for line search learning rate
+          n_epochs = 20000,
+          lr_fe = .1,
+          scheduler_factor_fe = .9999,
+          n_epochs_fe = 15000,
+          scale = 1,
+          tol = 1e-4,
+          print_every = 1000,
+          n_jobs = 1,
+          verbose = True):
+
+        device='cpu'
+        X = torch.tensor(X).float().to(device)
+        Y = torch.tensor(Y).float().to(device)
+        D = torch.tensor(D).float().to(device)
+        C = torch.tensor(C).float().to(device) 
+            
+        # --- Build flat config list (preserves original r numbering: lr -> sf -> rep) ---
+        configs = {'random_seed': [], 'lr': [], 'scheduler_factor': [], 'loglike': []}
+        jobs = []
+        r = 0
+        for lr in lrs:
+            for scheduler_factor in scheduler_factors:
+                for _ in range(reps):
+                    jobs.append((lr, scheduler_factor, r))
+                    configs['random_seed'].append(r)
+                    configs['lr'].append(lr)
+                    configs['scheduler_factor'].append(scheduler_factor)
+                    r += 1
+        
+        # --- Run all (lr, scheduler_factor, rep) combinations in parallel ---
+        outs = Parallel(n_jobs=min(n_jobs, len(jobs)), verbose=10 if verbose else 0)(
+            delayed(fit_model)(
+                X, Y, D, C,
+                K = self.K,
+                L = self.L,
+                beta = self.beta,
+                b = self.b,
+                phi = self.phi,
+                lambd1 = self.lambd1,
+                lambd2 = self.lambd2,
+                B = B,
+                lr = lr_i,
+                scheduler_factor = sf_i,
+                n_epochs = n_epochs,
+                scale = scale,
+                tol = tol,
+                verbose = False,           # silence inner verbose under parallel workers
+                print_every = print_every,
+                device = device,
+                random_seed = seed_i,
+            )
+            for (lr_i, sf_i, seed_i) in jobs
+        )
+        
+        configs['loglike'] = [o['loglike'] for o in outs]
+        self.configs = configs
+        self.outs = outs
+        ind = np.argmax([o['loglike'] for o in self.outs])  
+        self.loglike = self.outs[ind]['loglike']
+        self.gradnorm = self.outs[ind]['grad_norm']
+        self.aic = self.outs[ind]['aic']
+        self.sigma = ch(self.outs[ind]['L'], tril=False).cpu().numpy()
+        self.L = self.outs[ind]['L'].cpu().numpy()
+        self.lambd = self.outs[ind]['lambd'].cpu().numpy()
+        self.phi = self.outs[ind]['phi'].cpu().numpy()
+        self.b = self.outs[ind]['b'].cpu().numpy()
+        self.beta = self.outs[ind]['beta'].cpu().numpy()
+        
     def fit(self,
               X,
               Y,
@@ -547,8 +628,9 @@ class ScalingLawFixedEffects:
 
             # Projection step
             with torch.no_grad():
+
                 # phi
-                self.phi.clamp_(min=0, max=None)
+                phi.clamp_(min=1e-6, max=None)
     
                 # Lambd
                 self.lambd1.clamp_(min=0, max=None)
