@@ -202,11 +202,11 @@ def fit_model(
                          ['L','lambd1','lambd2','phi','b','beta'], parameters)}
 
         # Logging
-        if verbose and ((ep+1) % print_every == 0):
-            lr_now = scheduler.get_last_lr()[0]
-            print(f"epoch={ep+1:5d}, B={B:5d}, grad={total_grad:.5f}, "
-                  f"loss={loss.item():.5f}, lr={lr_now:.5f}")
-            print(" grads:", grad_info)
+        #if verbose and ((ep+1) % print_every == 0):
+        #    lr_now = scheduler.get_last_lr()[0]
+        #    print(f"epoch={ep+1:5d}, B={B:5d}, grad={total_grad:.5f}, "
+        #          f"loss={loss.item():.5f}, lr={lr_now:.5f}")
+        #    print(" grads:", grad_info)
 
         optimizer.step()
         scheduler.step(loss.item())
