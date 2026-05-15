@@ -350,7 +350,7 @@ class ScalingLaw:
         r=0
         for lr in tqdm(lrs, desc="Different lrs"):
             for scheduler_factor in tqdm(scheduler_factors, desc="Different scheduler factors"):
-                for rep in tqdm(range(reps), desc="Reps"):
+                for _ in tqdm(range(reps), desc="Reps"):
                     outs.append(fit_model(X,
                                           Y,
                                           D,
@@ -400,47 +400,46 @@ class ScalingLaw:
                      n_samples=1000,
                      burn_in=100,
                      thinning=20,
+                     return_map=False,
                      random_seed = 42):
         
-        torch.manual_seed(random_seed)
-        ind_fam = D[:,fam_number]==1
-        X_tensor = torch.tensor(X, requires_grad=False)[ind_fam].float()
-        Y_tensor = torch.tensor(Y, requires_grad=False)[ind_fam].float()
-        C_tensor = torch.tensor(C, requires_grad=False).float()
-        beta_tensor = torch.tensor(self.beta, requires_grad=False).float()
-        lambd_tensor = torch.tensor(self.lambd, requires_grad=False).float()
-        b_tensor = torch.tensor(self.b, requires_grad=False).float()
-        phi_tensor = torch.tensor(self.phi, requires_grad=False).float()
-        
-        A_map = torch.zeros(self.K, requires_grad=True).float()  # Initialize A as zeros
-        def loss_function(A_var):
-            return -joint_dist_one_fam(X_tensor, Y_tensor, C_tensor, 
-                                        A_var, beta_tensor, lambd_tensor, 
-                                        b_tensor, phi_tensor)
-        def closure():
-            optimizer.zero_grad()
-            loss = loss_function(A_map)
-            loss.backward()
-            return loss
-        optimizer = LBFGS([A_map], lr=1, max_iter=100, history_size=10, line_search_fn="strong_wolfe")
-        optimizer.step(closure)
-        A_sigma = torch.linalg.inv(torch.autograd.functional.hessian(loss_function, A_map)).float()
-        A_map, A_sigma = A_map.float().detach().cpu(), A_sigma.detach().cpu()
-        sigma = A_sigma 
-        
-        return metropolis_hastings(A_map,
-                                   sigma,
-                                   X_tensor,
-                                   Y_tensor,
-                                   C_tensor,
-                                   beta_tensor,
-                                   lambd_tensor,
-                                   b_tensor,
-                                   phi_tensor,
-                                   n_samples=n_samples,
-                                   burn_in=burn_in,
-                                   thinning=thinning).cpu().numpy()
+        return SampleAlpha(0,
+                           betas=[self.beta],
+                           lambds=[self.lambd],
+                           bs=[self.b],
+                           phis=[self.phi],
+                           sigmas=[self.sigma],
+                           D=D,
+                           fam_number=fam_number,
+                           X=X,
+                           Y=Y,
+                           C=C,
+                           K=self.K,
+                           random_seed=random_seed,
+                           n_samples=n_samples,
+                           burn_in=burn_in,
+                           thinning=thinning,
+                           return_map=return_map).numpy().reshape((-1,self.K))  
+    
+    def predict(self,
+                X_train, Y_train, D_train,
+                X_test, D_test,
+                C):
 
+        sig = lambda x: 1/(1+np.exp(-x))
+        fam_numbers = np.argmax(D_test, axis=1)
+        A_hash = {}
+        for fam_number in np.unique(fam_numbers):
+            A_hash[fam_number] = self.sample_alpha(X_train,
+                                                   Y_train,
+                                                   D_train,
+                                                   C,
+                                                   fam_number,
+                                                   return_map=True)
+        A_map = np.vstack([A_hash[fam_number] for fam_number in fam_numbers])
+        mu = C+(1-C)*sig((X_test@self.beta+A_map)@self.lambd+self.b)
+        return mu
+        
 def log_like_fe(X, Y, D, C, A, beta, lambd, b, phi):
     mu = C+(1-C)*sigmoid(torch.clamp(((X@beta+D@A)@lambd+b), min=-4.5, max=4.5))
     beta_dist = Beta(phi*mu, phi*(1-mu))
@@ -908,7 +907,8 @@ def SampleAlpha(i,
                  random_seed=42,
                  n_samples=10,
                  burn_in=100,
-                 thinning=30):
+                 thinning=30,
+                 return_map=False):
     
     torch.manual_seed(random_seed)
     
@@ -934,8 +934,8 @@ def SampleAlpha(i,
         loss = loss_function(A_map)
         loss.backward()
         return loss
-    optimizer = torch.optim.LBFGS([A_map], lr=1, max_iter=100,
-                                  history_size=10, line_search_fn="strong_wolfe")
+    optimizer = torch.optim.LBFGS([A_map], lr=1, max_iter=1000,
+                                  history_size=100, line_search_fn="strong_wolfe")
     optimizer.step(closure)
 
     A_sigma = torch.linalg.inv(
@@ -944,6 +944,9 @@ def SampleAlpha(i,
     
     A_map, A_sigma = A_map.float().detach().cpu(), A_sigma.detach().cpu()
 
+    if return_map:
+        return A_map
+    
     # Sample alphas
     return metropolis_hastings(
         A_map, A_sigma, X_tensor, Y_tensor, C_tensor,
