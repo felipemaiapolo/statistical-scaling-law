@@ -1138,7 +1138,7 @@ def SampleParams(beta, b, phi, lambd1, lambd2, sigma, cov, n=100):
 
     return betas, bs, phis, lambds, sigmas
 
-def log_like_fe(X, Y, D, C, A, beta, lambd, b, phi):
+def log_like_fe(X, Y, D, C, A, beta, lambd, b, phi, eps: float = 1e-6):
 
     """
     Conditional ("fixed-effects" form) log-likelihood given the latent A.
@@ -1237,6 +1237,7 @@ def metropolis_hastings(init,
                         b_tensor,
                         phi_tensor,
                         sigma_tensor,
+                        reg=1e-3,
                         n_samples=2000,
                         burn_in=100,
                         thinning=10):
@@ -1264,8 +1265,9 @@ def metropolis_hastings(init,
     samples = torch.zeros((n_samples, d), dtype=init.dtype, device=init.device)
     current = init.clone()
     current_log_density = log_density(current)
-    
-    cov_chol = torch.linalg.cholesky(sigma_prop)  # Cholesky decomposition for efficient sampling
+
+    reg_mat = torch.tensor(reg*np.eye(sigma_prop.shape[0]), dtype=init.dtype, device=init.device)
+    cov_chol = torch.linalg.cholesky(sigma_prop+reg_mat)  # Cholesky decomposition for efficient sampling
     
     collected = 0
     i = 0

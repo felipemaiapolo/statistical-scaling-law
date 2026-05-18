@@ -82,7 +82,8 @@ delete_models = {'meta-llama-3':['calme-2.2-llama3-70b',
                             'lambda-gemma-2-9b-dpo',
                             'n3n_gemma-2-9b-it_20241029_1532',
                             'n3n_gemma-2-9b-it_20241110_2026',
-                            'magnum-v3-9b-customgemma2']}
+                            'magnum-v3-9b-customgemma2',
+                            'gemma-2-9b', 'gemma-2-9b-it']}
 
 Y_names_tidy = {'gsm8k':'GSM8k','ifeval':'IFEval','hellaswag':'HellaSwag','mmlu':'MMLU','arc':'ARC',
                 'truthfulqa':'TruthfulQA','winogrande':'Winogrande','bbh':'BBH','math':'MATH',
