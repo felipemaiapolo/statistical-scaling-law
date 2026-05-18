@@ -7,20 +7,45 @@ from torch import nn
 from torch.nn import Parameter
 from torch.distributions import Beta, MultivariateNormal, Normal
 from torch.optim import Adam, LBFGS
-from torch.optim.lr_scheduler import ReduceLROnPlateau, ExponentialLR
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.autograd.functional import hessian, jacobian
-from joblib import Parallel, delayed
 import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
-from joblib import Parallel, delayed
 
 # Aliases / constants
 sigmoid = torch.sigmoid
 
+# Fitting
 def ch(x: torch.Tensor, tril: bool = True) -> torch.Tensor:
+    
     """
-    Build a lower-triangular matrix (or its product) from a flattened tensor.
+    Build a lower-triangular matrix from a flattened vector of entries, or
+    return the implied positive-semidefinite product L L^T.
+ 
+    Given `x` of length n(n+1)/2, the entries are placed into the lower
+    triangle (row-major over `torch.tril_indices`) of an n x n matrix L. If
+    `tril=True`, L itself is returned; if `tril=False`, L @ L^T is returned,
+    which is useful for reconstructing a covariance matrix from its Cholesky
+    factor.
+ 
+    Parameters
+    ----------
+    x : torch.Tensor
+        1-D tensor of length n(n+1)/2 holding the lower-triangular entries.
+    tril : bool, default True
+        If True, return the lower-triangular L. If False, return L @ L^T.
+ 
+    Returns
+    -------
+    torch.Tensor
+        Either L (when `tril=True`) or L @ L^T (when `tril=False`).
+ 
+    Raises
+    ------
+    ValueError
+        If `len(x)` is not of the form n(n+1)/2 for some integer n.
     """
+    
     n = int((2 * len(x)) ** 0.5)
     if (n * (n + 1)) // 2 != len(x):
         raise ValueError("Length of x is not suitable to fill a lower triangular matrix")
@@ -49,9 +74,72 @@ def log_like(
     random_seed = 42,
     agg=True
 ) -> torch.Tensor:
+    
     """
-    Compute the Monte Carlo log-likelihood under the specified model.
+    Monte Carlo log-likelihood for the Beta mixed-effects model with
+    homoscedastic dispersion.
+ 
+    For each observation i and outcome j, the model is
+ 
+        Y_{ij} | alpha_{f(i)} ~ Beta(phi_j * mu_{ij}, phi_j * (1 - mu_{ij}))
+ 
+    with
+ 
+        mu_{ij} = C_j + (1 - C_j) * sigmoid( (X_i @ beta + alpha_{f(i)}) @ lambd + b )_j
+ 
+    and family-level random effect alpha_{f(i)} ~ N(0, L L^T), K-dimensional,
+    with L (Cholesky factor) stored as its flattened lower-triangular entries.
+    The marginal likelihood is approximated by Monte Carlo: B standard-normal
+    draws Z are transformed to alpha = Z @ L^T, the per-family
+    log-likelihoods are averaged in the log-domain via logsumexp, and
+    (optionally) summed across families.
+ 
+    Parameters
+    ----------
+    X : (n, p) tensor
+        Covariates entering the mean.
+    Y : (n, J) tensor
+        Outcomes in (0, 1); NaN entries are treated as missing and contribute
+        zero to the log-likelihood.
+    D : (n, F) tensor
+        Family-membership indicator matrix mapping observations to families.
+    C : (J,) or (1, J) tensor
+        Lower bound (floor) for each outcome's mean.
+    beta : (p, K) tensor
+        Mean-equation coefficients in latent factor space.
+    lambd : (K, J) tensor
+        Loading matrix from latent factors to outcomes.
+    b : (1, J) tensor
+        Per-outcome intercept inside the sigmoid.
+    phi : (1, J) tensor
+        Per-outcome dispersion (Beta concentration). Must be positive.
+    L : (K(K+1)/2,) tensor
+        Flattened lower-triangular Cholesky factor of the random-effects
+        covariance.
+    K : int
+        Latent factor dimension.
+    Z : (B, K) tensor, optional
+        Pre-drawn standard normal samples. If None, B fresh samples are drawn
+        using `random_seed`.
+    B : int, default 100000
+        Number of Monte Carlo samples when Z is not supplied.
+    eps : float, default 1e-6
+        Clamp applied to mu to keep it inside (eps, 1 - eps).
+    device : str, default 'cpu'
+        Device for fresh Z draws when Z is None.
+    random_seed : int, default 42
+        Seed used when drawing Z internally.
+    agg : bool, default True
+        If True, return the summed log-likelihood (scalar). If False, return
+        the per-family log-likelihood vector of length F.
+ 
+    Returns
+    -------
+    torch.Tensor
+        Scalar total log-likelihood if `agg=True`, else per-family
+        log-likelihoods.
     """
+    
     if Z is not None:
         B = Z.shape[0]
     else:
@@ -109,10 +197,79 @@ def fit_model(
     device: str = 'cpu',
     random_seed: int = 42,
 ) -> dict:
+    
     """
-    Fit the mixed-effects model via stochastic optimization.
-    Returns history, AIC, best parameters, and convergence flag.
+    Fit the Beta mixed-effects model by stochastic Monte Carlo maximum
+    likelihood.
+ 
+    The optimizer is Adam with a ReduceLROnPlateau schedule. The loading
+    matrix lambd is split into a non-negative diagonal block (lambd1, length
+    K) and a free rectangular block (lambd2, shape K x (J-K)) to identify the
+    model. After each step, the Cholesky factor L is renormalized so that
+    L L^T has unit diagonal (a correlation matrix), and phi and lambd1 are
+    clamped to be non-negative. Final parameter estimates are obtained by
+    averaging the most recent `frac_hist_params` fraction of parameter
+    snapshots, which smooths the stochastic-MLE iterates.
+ 
+    Parameters
+    ----------
+    X : (n, p) tensor
+        Covariates.
+    Y : (n, J) tensor
+        Outcomes in (0, 1); NaNs allowed.
+    D : (n, F) tensor
+        Family-indicator matrix.
+    C : (J,) or (1, J) tensor
+        Per-outcome floor for the mean.
+    K : int, default 3
+        Latent factor dimension.
+    L, beta, b, phi, lambd1, lambd2 : tensors or None
+        Optional starting values. If None each is drawn randomly; if provided
+        each is perturbed by a small random draw (warm start with jitter).
+    B : int, default 1000
+        Number of Monte Carlo samples per evaluation.
+    B_frequency : int, default 1
+        Resample Z (and snapshot parameters) every `B_frequency` epochs.
+    max_hist_params : int
+        Keep at most this many parameter snapshots in memory.
+    frac_hist_params : float, default 0.2
+        Fraction of the *most recent* snapshots to average when forming the
+        final estimate.
+    lr : float, default 1e-2
+        Adam learning rate.
+    scheduler_factor : float, default 0.9
+        Multiplicative LR-decay factor on plateau.
+    scheduler_patience : int, default 30
+        Epochs with no improvement before LR is reduced.
+    scheduler_threshold : float, default 1e-3
+        Absolute improvement threshold for ReduceLROnPlateau.
+    n_epochs : int, default 10000
+        Maximum number of optimization steps.
+    print_every : int, default 1000
+        Logging interval (currently the logging is commented out).
+    scale : float, default 1.0
+        Standard deviation of random initialization draws.
+    tol : float, default 1e-3
+        Reserved for convergence checks (not currently used to early-stop).
+    verbose : bool, default True
+        Whether to show a progress bar.
+    device : str
+        Torch device.
+    random_seed : int
+        Seed for reproducible Z draws and initializations.
+ 
+    Returns
+    -------
+    dict
+        Dictionary with keys:
+        - 'hist'      : list of per-epoch (normalized) negative log-likelihoods.
+        - 'loglike'   : final log-likelihood at the averaged parameters.
+        - 'aic'       : Akaike Information Criterion at the averaged parameters.
+        - 'grad_norm' : per-parameter and total gradient norms at the optimum.
+        - 'L', 'beta', 'b', 'phi', 'lambd1', 'lambd2', 'lambd' :
+            averaged parameter tensors.
     """
+    
     torch.manual_seed(random_seed)
 
     N = D.shape[1]
@@ -283,7 +440,32 @@ def fit_model(
     }
 
 class ScalingLaw:
+
+    """
+    Convenience wrapper for the Beta mixed-effects scaling-law model with K
+    latent factors and per-outcome (homoscedastic) dispersion.
+ 
+    Provides fitting via random restarts (`fit`), posterior sampling of
+    family-level random effects (`sample_alpha`), and prediction for new
+    observations belonging to families seen in training (`predict`).
+ 
+    After fitting, the best-run parameters are stored as NumPy arrays on
+    `self`: `beta`, `b`, `phi`, `lambd1` (implicit), `lambd2` (implicit),
+    `lambd`, `L`, `sigma`. The full sweep is available in `self.outs` and
+    `self.configs`.
+    """
+    
     def __init__(self, K):
+
+        """
+        Initialize a scaling-law model.
+ 
+        Parameters
+        ----------
+        K : int
+            Number of latent factors.
+        """
+        
         self.K = K
         self.L = None
         self.beta = None
@@ -291,140 +473,82 @@ class ScalingLaw:
         self.phi = None
         self.lambd1 = None
         self.lambd2 = None
-
-    def fit_parallel(self,
-          X,
-          Y,
-          D,
-          C,
-          fe_start = False, 
-          reps = 10,
-          B = 5000, #initial MC samples
-          B_frequency = 1,
-          lrs = [.05,.01,.005], 
-          scheduler_factors = [.99],  # Decay factor for line search learning rate
-          n_epochs = 20000,
-          lr_fe = .1,
-          scheduler_factor_fe = .9999,
-          n_epochs_fe = 15000,
-          scale = 1,
-          tol = 1e-4,
-          print_every = 1000,
-          n_jobs = 1,
-          verbose = True):
-
-        device='cpu'
-        X = torch.tensor(X).float().to(device)
-        Y = torch.tensor(Y).float().to(device)
-        D = torch.tensor(D).float().to(device)
-        C = torch.tensor(C).float().to(device) 
-            
-        # --- Build flat config list (preserves original r numbering: lr -> sf -> rep) ---
-        configs = {'random_seed': [], 'lr': [], 'scheduler_factor': [], 'loglike': []}
-        jobs = []
-        r = 0
-        for lr in lrs:
-            for scheduler_factor in scheduler_factors:
-                for _ in range(reps):
-                    jobs.append((lr, scheduler_factor, r))
-                    configs['random_seed'].append(r)
-                    configs['lr'].append(lr)
-                    configs['scheduler_factor'].append(scheduler_factor)
-                    r += 1
-        
-        # --- Run all (lr, scheduler_factor, rep) combinations in parallel ---
-        outs = Parallel(n_jobs=min(n_jobs, len(jobs)), verbose=10 if verbose else 0)(
-            delayed(fit_model)(
-                X, Y, D, C,
-                K = self.K,
-                L = self.L,
-                beta = self.beta,
-                b = self.b,
-                phi = self.phi,
-                lambd1 = self.lambd1,
-                lambd2 = self.lambd2,
-                B = B,
-                lr = lr_i,
-                scheduler_factor = sf_i,
-                n_epochs = n_epochs,
-                scale = scale,
-                tol = tol,
-                verbose = False,           # silence inner verbose under parallel workers
-                print_every = print_every,
-                device = device,
-                random_seed = seed_i,
-            )
-            for (lr_i, sf_i, seed_i) in jobs
-        )
-        
-        configs['loglike'] = [o['loglike'] for o in outs]
-        self.configs = configs
-        self.outs = outs
-        ind = np.argmax([o['loglike'] for o in self.outs])  
-        self.loglike = self.outs[ind]['loglike']
-        self.gradnorm = self.outs[ind]['grad_norm']
-        self.aic = self.outs[ind]['aic']
-        self.sigma = ch(self.outs[ind]['L'], tril=False).cpu().numpy()
-        self.L = self.outs[ind]['L'].cpu().numpy()
-        self.lambd = self.outs[ind]['lambd'].cpu().numpy()
-        self.phi = self.outs[ind]['phi'].cpu().numpy()
-        self.b = self.outs[ind]['b'].cpu().numpy()
-        self.beta = self.outs[ind]['beta'].cpu().numpy()
         
     def fit(self,
               X,
               Y,
               D,
               C,
-              fe_start = False, 
               reps = 10,
               B = 5000, #initial MC samples
               B_frequency = 1,
               lrs = [.05,.01,.005], 
               scheduler_factors = [.99],  # Decay factor for line search learning rate
               n_epochs = 20000,
-              lr_fe = .1,
-              scheduler_factor_fe = .9999,
-              n_epochs_fe = 15000,
               scale = 1,
               tol = 1e-4,
               print_every = 1000,
               verbose = True,
               device='cpu'):
+
+        """
+        Run a random-restart grid over learning rates and scheduler factors
+        and keep the run with the highest log-likelihood.
+ 
+        Each combination of (lr, scheduler_factor) is repeated `reps` times
+        with a distinct seed, for a total of
+        len(lrs) * len(scheduler_factors) * reps full fits. The best fit
+        (by log-likelihood) populates the model attributes.
+ 
+        Parameters
+        ----------
+        X : array-like, shape (n, p)
+            Covariates.
+        Y : array-like, shape (n, J)
+            Outcomes in (0, 1); NaNs are treated as missing.
+        D : array-like, shape (n, F)
+            Family-indicator matrix.
+        C : array-like, shape (J,) or (1, J)
+            Per-outcome floor.
+        reps : int, default 10
+            Number of random restarts per (lr, scheduler_factor) pair.
+        B : int, default 5000
+            Monte Carlo samples per evaluation.
+        B_frequency : int, default 1
+            Resampling frequency for Z (see `fit_model`).
+        lrs : list of float
+            Learning rates to try.
+        scheduler_factors : list of float
+            ReduceLROnPlateau decay factors to try.
+        n_epochs : int, default 20000
+            Maximum epochs per fit.
+        scale : float, default 1
+            Initialization scale.
+        tol : float, default 1e-4
+            Convergence tolerance forwarded to `fit_model`.
+        print_every : int, default 1000
+            Logging interval (passed to `fit_model`).
+        verbose : bool, default True
+            Toggle progress bars.
+        device : str, default 'cpu'
+            Torch device.
+ 
+        Returns
+        -------
+        None
+            Populates `self` in place. Notably:
+                - self.outs       : list of all `fit_model` outputs.
+                - self.configs    : dict of hyperparameters and log-likelihoods.
+                - self.loglike    : best log-likelihood.
+                - self.aic        : AIC of the best fit.
+                - self.beta, self.b, self.phi, self.lambd, self.L,
+                  self.sigma    : best-fit parameters as NumPy arrays.
+        """
         
         X = torch.tensor(X).float().to(device)
         Y = torch.tensor(Y).float().to(device)
         D = torch.tensor(D).float().to(device)
         C = torch.tensor(C).float().to(device)
-
-        if fe_start:
-
-            #model_starts = []
-            #for lr in tqdm(lrs, desc="Different lrs"):
-            #    for scheduler_factor in tqdm(scheduler_factors, desc="Different scheduler factors"):
-            #model_starts.append(ScalingLawFixedEffects(self.K))
-            #model_starts[-1].fit(X, Y, D, C, lr=lr, n_epochs=n_epochs_fe, scheduler_factor = scheduler_factor, verbose=verbose, device=device)
-            #losses = [m.hist[-1] for m in model_starts]
-            #self.model_start = model_starts[np.argmin(losses)]
-
-            self.model_start = ScalingLawFixedEffects(self.K)
-            self.model_start.fit(X, Y, D, C, lr=lr_fe, n_epochs=n_epochs_fe, scheduler_factor = scheduler_factor_fe, verbose=verbose, device=device)
-            
-            corr = torch.corrcoef(self.model_start.A.cpu().detach().T)
-            if self.K>1: 
-                L = torch.linalg.cholesky(corr)
-                L = np.tril(L.cpu().detach().numpy())
-                L = L[L != 0]
-            else:
-                L = [[1]]
-            
-            self.L = torch.tensor(L).float()
-            self.beta = self.model_start.beta
-            self.b = self.model_start.b
-            self.phi = self.model_start.phi
-            self.lambd1 = self.model_start.lambd1
-            self.lambd2 = self.model_start.lambd2
- 
         
         outs = []
         configs = {'random_seed':[], 'lr':[], 'scheduler_factor':[], 'loglike':[]}
@@ -483,6 +607,46 @@ class ScalingLaw:
                      thinning=20,
                      return_map=False,
                      random_seed = 42):
+
+        """
+        Draw posterior samples of the latent random effect A for a single
+        family, conditional on the fitted point estimates of the population
+        parameters.
+ 
+        Internally calls `SampleAlpha` with one-element lists for all
+        parameters (so that posterior uncertainty in the population
+        parameters is *not* propagated; only A is sampled). The returned
+        array is reshaped to (n_samples, K).
+ 
+        Parameters
+        ----------
+        X : array-like, shape (n, p)
+            Full-dataset covariates.
+        Y : array-like, shape (n, J)
+            Full-dataset outcomes.
+        D : array-like, shape (n, F)
+            Family-indicator matrix.
+        C : array-like
+            Per-outcome floor.
+        fam_number : int
+            Column index of D selecting the family to sample.
+        n_samples : int, default 1000
+            Number of post-burn-in samples.
+        burn_in : int, default 100
+            MH burn-in.
+        thinning : int, default 20
+            MH thinning interval.
+        return_map : bool, default False
+            If True, return the MAP estimate of A instead of MH samples.
+        random_seed : int, default 42
+            Seed for reproducibility.
+ 
+        Returns
+        -------
+        np.ndarray, shape (n_samples, K) or (1, K)
+            Posterior samples of A, or the MAP estimate reshaped to (1, K)
+            when `return_map=True`.
+        """
         
         return SampleAlpha(0,
                            betas=[self.beta],
@@ -507,6 +671,41 @@ class ScalingLaw:
                 X_test, D_test,
                 C):
 
+        """
+        Predict outcome means for test observations, using MAP estimates of
+        the family-level random effects fitted on training data.
+ 
+        For each unique family appearing in the test set, the MAP of A is
+        computed from the training data (via `sample_alpha(return_map=True)`)
+        and reused for all test rows in that family. Predicted means are then
+        the deterministic forward-pass of the model:
+ 
+            mu = C + (1 - C) * sigmoid( (X_test @ beta + A_map) @ lambd + b )
+ 
+        This implementation assumes every family in `D_test` is also
+        represented in `D_train` (otherwise the MAP cannot be estimated).
+ 
+        Parameters
+        ----------
+        X_train : array-like, shape (n_train, p)
+            Training covariates (used to estimate A_map per family).
+        Y_train : array-like, shape (n_train, J)
+            Training outcomes.
+        D_train : array-like, shape (n_train, F)
+            Family indicators for training rows.
+        X_test : array-like, shape (n_test, p)
+            Test covariates.
+        D_test : array-like, shape (n_test, F)
+            Family indicators for test rows.
+        C : array-like
+            Per-outcome floor.
+ 
+        Returns
+        -------
+        np.ndarray, shape (n_test, J)
+            Predicted Beta means for the test set.
+        """
+        
         sig = lambda x: 1/(1+np.exp(-x))
         fam_numbers = np.argmax(D_test, axis=1)
         A_hash = {}
@@ -520,233 +719,10 @@ class ScalingLaw:
         A_map = np.vstack([A_hash[fam_number] for fam_number in fam_numbers])
         mu = C+(1-C)*sig((X_test@self.beta+A_map)@self.lambd+self.b)
         return mu
-        
-def log_like_fe(X, Y, D, C, A, beta, lambd, b, phi):
-    mu = C+(1-C)*sigmoid(torch.clamp(((X@beta+D@A)@lambd+b), min=-4.5, max=4.5))
-    beta_dist = Beta(phi*mu, phi*(1-mu))
-
-    nan_mask = torch.isnan(Y) #dealing with missing values
-    Y_clipped = torch.where(nan_mask, torch.full_like(Y, 0.5), Y)
-    ll_terms = beta_dist.log_prob(Y_clipped[None, :])
-    loglike = torch.where(nan_mask, torch.zeros_like(ll_terms), ll_terms).sum()
-    return loglike
-    
-class ScalingLawFixedEffects:
-    def __init__(self, K):
-        self.K = K
-        self.A = None
-        self.beta = None
-        self.b = None
-        self.phi = None
-        self.lambd1 = None
-        self.lambd2 = None
-        
-    def fit(self,
-            X,
-            Y,
-            D,
-            C,
-            lr = .5,  # Initial learning rate
-            reg = 1e1,
-            scheduler_factor: float = .9,    # reduction factor on plateau
-            scheduler_patience: int = 30,     # epochs with no improvement before reducing
-            scheduler_threshold: float = 1e-3,
-            n_epochs = 15000,
-            scale = 1e-4,
-            tol = 1e-4,
-            verbose = True,
-            print_every = 500,
-            device='cpu',
-            random_seed = 42):
-        
-        N = D.shape[1]
-        p = X.shape[1]
-        J = Y.shape[1]
-        K = self.K
-            
-        # Initializing parameters for training
-        torch.manual_seed(random_seed)
-        if self.A is None: self.A = Parameter(torch.normal(0, scale, size=(N,K), device=device))
-        if self.beta is None: self.beta = Parameter(torch.normal(0, scale, size=(p, K), device=device))
-        if self.b is None: self.b = Parameter(torch.normal(0, scale, size=(1, J), device=device))
-        if self.phi is None: self.phi = Parameter(torch.normal(0, scale, size=(1, J), device=device).abs())
-        if self.lambd1 is None: self.lambd1 = Parameter(torch.normal(0, scale, size=(K,), device=device).abs())
-        if self.lambd2 is None: self.lambd2 = Parameter(torch.normal(0, scale, size=(K,J-K), device=device))
-
-          
-        # Initialize parameters
-        parameters = [self.A, self.lambd1, self.lambd2, self.phi, self.b, self.beta]
-        optimizer = Adam(parameters, lr=lr)
-        scheduler  = ReduceLROnPlateau(
-            optimizer,
-            mode='min',
-            factor=scheduler_factor,
-            patience=scheduler_patience,
-            threshold=scheduler_threshold,
-            threshold_mode='abs'
-        )
-    
-        hist = []
-        
-        for ep in tqdm(range(n_epochs), desc="Training FE model", disable=not verbose):
-            
-            lambd = torch.hstack((torch.diag(self.lambd1), self.lambd2)) 
-            phi = self.phi
-            
-            # Zero gradients
-            for param in parameters:
-                if param.grad is not None:
-                    param.grad.zero_()
-            
-            # Compute the initial loss
-            loss = - log_like_fe(X, Y, D, C, self.A, self.beta, lambd, self.b, phi)
-            loss /= Y.shape[0] * Y.shape[1]
-            if self.K>1: loss += reg * torch.square(torch.diag(torch.cov(self.A.T)) - 1).sum()
-            else: loss += reg * torch.square(torch.var(self.A) - 1).sum()
-            hist.append(loss.item())
-
-            # Compute gradients
-            loss.backward()
-                
-            # Calculate the gradient norm
-            grad_norm = 0
-            for param in parameters:
-                grad_norm += (param.grad**2).sum()
-            grad_norm = (grad_norm)**.5
-
-            # Print diagnostics
-            if verbose: 
-                if (ep+1)%print_every==0:
-                    print(f"epoch = {ep+1:10}, Grad {grad_norm.item():.10f}, Loss {loss.item():.10f}, LR {scheduler.get_last_lr()[0]:.10f}")
-            if grad_norm<tol:
-                print(f"epoch = {ep+1:10}, Grad {grad_norm.item():.10f}, Loss {loss.item():.10f}, LR {scheduler.get_last_lr()[0]:.10f}")
-                break
-            
-            # Update
-            optimizer.step()
-            scheduler.step(loss.item())
-
-            # Projection step
-            with torch.no_grad():
-
-                # phi
-                phi.clamp_(min=1e-6, max=None)
-    
-                # Lambd
-                self.lambd1.clamp_(min=0, max=None)
-            
-            self.hist = hist
-
-        # Out
-        self.A = self.A.detach().cpu()
-        self.lambd1 = self.lambd1.detach().cpu()
-        self.lambd2 = self.lambd2.detach().cpu()
-        self.phi = self.phi.detach().cpu()
-        self.b = self.b.detach().cpu()
-        self.beta = self.beta.detach().cpu()
-
-
-def joint_dist_one_fam(X, Y, C, A, beta, lambd, b, phi, sigma, device='cpu'):
-    D = torch.eye(1).to(device)
-    prior = torch.distributions.MultivariateNormal(
-        torch.zeros(A.squeeze().shape[0], device=device),
-        covariance_matrix=sigma.to(device)
-    )
-    return log_like_fe(X.to(device), Y.to(device), D.to(device), C.to(device), A.to(device).squeeze()[None,:], beta.to(device), lambd.to(device), b.to(device), phi.to(device)) + prior.log_prob(A.to(device).squeeze()).to(device)
-
-
-def metropolis_hastings(init,
-                        sigma_prop,
-                        X_tensor,
-                        Y_tensor,
-                        C_tensor,
-                        beta_tensor,
-                        lambd_tensor,
-                        b_tensor,
-                        phi_tensor,
-                        sigma_tensor,
-                        n_samples=2000,
-                        burn_in=100,
-                        thinning=10):
-    """
-    Perform Metropolis-Hastings sampling in the log domain using PyTorch with thinning.
-    
-    Parameters:
-    - init: torch.Tensor, initial state of the chain.
-    - sigma: torch.Tensor, covariance matrix for the Gaussian proposal distribution.
-    - n_samples: int, number of samples to draw after burn-in.
-    - burn_in: int, number of initial samples to discard.
-    - thinning: int, interval at which to keep samples (e.g., 2 keeps every second sample).
-    
-    Returns:
-    - samples: torch.Tensor of shape (n_samples, d), sampled points.
-    """
-    def log_density(A):
-        return joint_dist_one_fam(X_tensor, Y_tensor, C_tensor, 
-                                  A, beta_tensor, lambd_tensor, 
-                                  b_tensor, phi_tensor, sigma_tensor)
-    
-    d = len(init)
-    samples = torch.zeros((n_samples, d), dtype=init.dtype, device=init.device)
-    current = init.clone()
-    current_log_density = log_density(current)
-    
-    cov_chol = torch.linalg.cholesky(sigma_prop)  # Cholesky decomposition for efficient sampling
-    
-    collected = 0
-    i = 0
-    while collected < n_samples:
-        for _ in range(thinning):
-            proposal = current + cov_chol @ torch.randn(d, dtype=init.dtype, device=init.device)
-            proposal_log_density = log_density(proposal)
-            
-            # Compute log acceptance probability
-            log_alpha = proposal_log_density - current_log_density
-            
-            if torch.log(torch.rand((), dtype=init.dtype, device=init.device)) < log_alpha:
-                current = proposal
-                current_log_density = proposal_log_density
-        
-        if i >= burn_in:
-            samples[collected] = current
-            collected += 1
-        i += 1
-    
-    return samples
-
-    
-### Computing Asympt Variance
-def pack_theta(beta, lambd1, lambd2, b, phi, sigma_lt):
-    return torch.cat([
-        beta.contiguous().view(-1),
-        lambd1.contiguous().view(-1),
-        lambd2.contiguous().view(-1),
-        b.contiguous().view(-1),
-        phi.contiguous().view(-1),
-        sigma_lt.contiguous().view(-1)
-    ])
-
-def unpack_theta(theta, shapes):
-    # shapes is a tuple: (beta_shape, lambd1_shape, lambd2_shape, b_shape, phi_shape, sigma_lt_shape)
-    beta_shape, lambd1_shape, lambd2_shape, b_shape, phi_shape, sigma_lt_shape = shapes
-    sizes = [torch.tensor(s).prod().item() for s in shapes]
-    
-    idx1 = sizes[0]
-    idx2 = idx1 + sizes[1]
-    idx3 = idx2 + sizes[2]
-    idx4 = idx3 + sizes[3]
-    idx5 = idx4 + sizes[4]
-    
-    beta_new = theta[:idx1].view(beta_shape)
-    lambd1_new = theta[idx1:idx2].view(lambd1_shape)
-    lambd2_new = theta[idx2:idx3].view(lambd2_shape)
-    b_new      = theta[idx3:idx4].view(b_shape)
-    phi_new    = theta[idx4:idx5].view(phi_shape)
-    sigma_lt_new = theta[idx5:].view(sigma_lt_shape)
-    
-    return beta_new, lambd1_new, lambd2_new, b_new, phi_new, sigma_lt_new
-
+           
+# Computing Asympt Variance
 def extract_lower_triangle(corr_matrix: torch.Tensor) -> torch.Tensor:
+    
     """
     Extracts the lower triangular part (excluding the diagonal) from a correlation matrix.
     
@@ -756,6 +732,7 @@ def extract_lower_triangle(corr_matrix: torch.Tensor) -> torch.Tensor:
     Returns:
         torch.Tensor: A 1D tensor containing the elements from the lower triangle (without the diagonal).
     """
+    
     n, m = corr_matrix.shape
     if n != m:
         raise ValueError("Input matrix must be square.")
@@ -764,6 +741,7 @@ def extract_lower_triangle(corr_matrix: torch.Tensor) -> torch.Tensor:
     return corr_matrix[tril_indices[0], tril_indices[1]]
 
 def reconstruct_corr_matrix(lower_triangle: torch.Tensor) -> torch.Tensor:
+    
     """
     Reconstructs a full symmetric correlation matrix from its vectorized lower triangular part (excluding the diagonal).
     The diagonal of the correlation matrix is set to 1.
@@ -778,6 +756,7 @@ def reconstruct_corr_matrix(lower_triangle: torch.Tensor) -> torch.Tensor:
         torch.Tensor: The reconstructed symmetric correlation matrix with ones on the diagonal.
                       The result remains on the same device as the input and supports gradient propagation.
     """
+    
     m = lower_triangle.numel()
     # Solve n*(n-1)/2 = m for n.
     n_float = (1 + torch.sqrt(torch.tensor(1 + 8 * m, 
@@ -804,6 +783,76 @@ def reconstruct_corr_matrix(lower_triangle: torch.Tensor) -> torch.Tensor:
     # The final matrix is: lower triangle + (lower triangle)^T + I.
     corr_matrix = M_lower + M_lower.t() + torch.eye(n, dtype=lower_triangle.dtype, device=lower_triangle.device)
     return corr_matrix
+    
+   
+def pack_theta(beta, lambd1, lambd2, b, phi, sigma_lt):
+    """
+    Pack all free model parameters into a single 1-D tensor.
+ 
+    The order is fixed: beta, lambd1, lambd2, b, phi, sigma_lt. This is the
+    inverse of `unpack_theta` and is used to feed
+    `torch.autograd.functional.hessian` / `jacobian`, which expect a flat
+    parameter vector.
+ 
+    Parameters
+    ----------
+    beta, lambd1, lambd2, b, phi, sigma_lt : tensors
+        Model parameters with their natural shapes.
+ 
+    Returns
+    -------
+    torch.Tensor
+        Concatenated 1-D parameter vector.
+    """
+    return torch.cat([
+        beta.contiguous().view(-1),
+        lambd1.contiguous().view(-1),
+        lambd2.contiguous().view(-1),
+        b.contiguous().view(-1),
+        phi.contiguous().view(-1),
+        sigma_lt.contiguous().view(-1)
+    ])
+ 
+def unpack_theta(theta, shapes):
+    """
+    Split a flat parameter vector back into its component tensors.
+ 
+    Inverse of `pack_theta`: given the flat vector `theta` and the original
+    parameter shapes, reshape the slices back into
+    (beta, lambd1, lambd2, b, phi, sigma_lt).
+ 
+    Parameters
+    ----------
+    theta : 1-D tensor
+        Packed parameter vector produced by `pack_theta`.
+    shapes : tuple of torch.Size
+        Tuple of the original shapes, in the same order used by `pack_theta`:
+        (beta_shape, lambd1_shape, lambd2_shape, b_shape, phi_shape,
+        sigma_lt_shape).
+ 
+    Returns
+    -------
+    tuple of torch.Tensor
+        (beta, lambd1, lambd2, b, phi, sigma_lt) reshaped views into `theta`.
+    """
+    # shapes is a tuple: (beta_shape, lambd1_shape, lambd2_shape, b_shape, phi_shape, sigma_lt_shape)
+    beta_shape, lambd1_shape, lambd2_shape, b_shape, phi_shape, sigma_lt_shape = shapes
+    sizes = [torch.tensor(s).prod().item() for s in shapes]
+    
+    idx1 = sizes[0]
+    idx2 = idx1 + sizes[1]
+    idx3 = idx2 + sizes[2]
+    idx4 = idx3 + sizes[3]
+    idx5 = idx4 + sizes[4]
+    
+    beta_new = theta[:idx1].view(beta_shape)
+    lambd1_new = theta[idx1:idx2].view(lambd1_shape)
+    lambd2_new = theta[idx2:idx3].view(lambd2_shape)
+    b_new      = theta[idx3:idx4].view(b_shape)
+    phi_new    = theta[idx4:idx5].view(phi_shape)
+    sigma_lt_new = theta[idx5:].view(sigma_lt_shape)
+    
+    return beta_new, lambd1_new, lambd2_new, b_new, phi_new, sigma_lt_new
 
 def GetAsymptVar(X, Y, D, C, model, K,
                  device = 'cuda',
@@ -811,47 +860,124 @@ def GetAsymptVar(X, Y, D, C, model, K,
                  lr = 1e-4,
                  grad_tol = 1e-3,
                  n_epochs = 100000,
+                 compute_hessian = True, 
+                 reg = 1e-3,
                  random_seed=42):
+
+    """
+    Compute asymptotic-variance estimates for the MLE returned in `model`.
+ 
+    Two estimators are produced (when applicable):
+        - Inverse observed information: V_H = (H + reg * I)^{-1}, where H is
+          the Hessian of the negative log-likelihood at theta_hat.
+        - Inverse outer-product-of-gradients: V_J = (J^T J + reg * I)^{-1},
+          where J is the Jacobian of the per-family log-likelihood
+          contributions (the BHHH / OPG ingredient).
+ 
+    Because the supplied parameters come from stochastic MLE iterates, the
+    routine first runs a deterministic fine-tuning pass (Adam with a fixed
+    Monte Carlo sample Z so the loss is smooth in theta) until the gradient
+    norm falls below `grad_tol` or `n_epochs` is reached; phi is given a
+    larger learning rate (10x). The Hessian and Jacobian are then evaluated
+    on CPU at the refined parameters.
+ 
+    Standard errors are produced by extracting the diagonal of each variance
+    matrix and taking square roots; they are returned grouped by parameter
+    block.
+ 
+    Parameters
+    ----------
+    X, Y, D, C : array-likes
+        Full-dataset covariates, outcomes, family indicators, and per-outcome
+        floors.
+    model : ScalingLaw
+        Fitted model from which initial parameters are taken.
+    K : int
+        Latent dimension.
+    device : str, default 'cuda'
+        Device used for the fine-tuning phase. Hessian and Jacobian are
+        always computed on CPU.
+    B : int, default 25000
+        Number of Monte Carlo samples held fixed during fine-tuning and
+        variance evaluation.
+    lr : float, default 1e-4
+        Base learning rate for the fine-tuning Adam optimizer (phi uses 10*lr).
+    grad_tol : float, default 1e-3
+        Early-stop threshold on the total gradient norm.
+    n_epochs : int, default 100000
+        Maximum fine-tuning epochs.
+    compute_hessian : bool, default True
+        If False, skip the Hessian-based estimator (the expensive one) and
+        return only the Jacobian-based estimator.
+    reg : float, default 1e-3
+        Diagonal regularization added before inversion to ensure stability.
+    random_seed : int, default 42
+        Seed used to draw Z.
+ 
+    Returns
+    -------
+    dict
+        Dictionary with up to two keys:
+        - 'H' : (when `compute_hessian=True`) a list `[info, ste_dict]` where
+            `info` contains the Hessian H, its regularized inverse V, and
+            the smallest eigenvalue of V; `ste_dict` maps parameter names
+            (suffixed with '_ste') to per-element standard errors.
+        - 'J' : list `[info, ste_dict]` with the OPG-based V and matching SEs.
+ 
+    Side effects
+    ------------
+    Displays two matplotlib plots: the fine-tuning loss curve and the
+    log-scale gradient-norm curve.
+    """
     
     norm_dist = MultivariateNormal(torch.zeros(K), torch.eye(K))
     torch.manual_seed(random_seed)
-    Z = norm_dist.sample(sample_shape=(B,)).to(device).double()
+    Z = norm_dist.sample(sample_shape=(B,)).to(device).float()
     beta = torch.tensor(model.beta,
                         device=device,
-                        dtype=torch.float64,
+                        dtype=torch.float32,
                         requires_grad=True)
     lambd1 = torch.tensor(np.diag(model.lambd[:,:K]),
                           device=device,
-                          dtype=torch.float64,
+                          dtype=torch.float32,
                           requires_grad=True)
     lambd2 = torch.tensor(model.lambd[:,K:],
                           device=device,
-                          dtype=torch.float64,
+                          dtype=torch.float32,
                           requires_grad=True)
     b = torch.tensor(model.b,
                      device=device,
-                     dtype=torch.float64,
+                     dtype=torch.float32,
                      requires_grad=True)
     phi = torch.tensor(model.phi,
                        device=device,
-                       dtype=torch.float64,
+                       dtype=torch.float32,
                        requires_grad=True)
     sigma_lt = torch.tensor(extract_lower_triangle(torch.tensor(model.sigma)).clone().detach().numpy(),
                             device=device,
-                            dtype=torch.float64,
+                            dtype=torch.float32,
                             requires_grad=True)
     param_shapes = (beta.shape, lambd1.shape, lambd2.shape, b.shape, phi.shape, sigma_lt.shape)
 
+    X=torch.tensor(X).to(device).float()
+    Y=torch.tensor(Y).to(device).float()
+    D=torch.tensor(D).to(device).float()
+    C=torch.tensor(C).to(device).float()
+
     def loss_from_theta(theta, Z=Z, jac=False, device=device):
+        """Evaluate (neg-)log-likelihood from the flat parameter vector theta.
+ 
+        Reconstructs the Cholesky factor L of the correlation matrix from
+        `sigma_lt`, rebuilds `lambd`, and calls `log_like`. If `jac=True`,
+        returns the per-family log-likelihoods (positive) for Jacobian
+        computation; otherwise returns the scalar negative log-likelihood.
+        """
         beta_new, lambd1_new, lambd2_new, b_new, phi_new, sigma_lt_new = unpack_theta(theta, param_shapes)
         lt = torch.linalg.cholesky(reconstruct_corr_matrix(sigma_lt_new))
         mask = torch.tril(torch.ones_like(lt)).bool()
         L_new = -lt[mask]
         lambd_new = torch.hstack((torch.diag(lambd1_new), lambd2_new))
-        loss = log_like(torch.tensor(X).to(device).double(),
-                         torch.tensor(Y).to(device).double(),
-                         torch.tensor(D).to(device).double(),
-                         torch.tensor(C).to(device).double(),
+        loss = log_like(X, Y, D, C,
                          beta_new,
                          lambd_new,
                          b_new,
@@ -921,31 +1047,69 @@ def GetAsymptVar(X, Y, D, C, model, K,
     phi = phi.cpu()
     sigma_lt = sigma_lt.cpu()
     Z = Z.cpu()
+    X = X.cpu()
+    Y = Y.cpu()
+    D = D.cpu()
+    C = C.cpu()
     theta = pack_theta(beta, lambd1, lambd2, b, phi, sigma_lt)
     def loss_from_theta2(theta):
         return loss_from_theta(theta, Z=Z, device=device)
     def loss_from_theta3(theta):
         return loss_from_theta(theta, Z=Z, jac=True, device=device)
-        
-    H = hessian(loss_from_theta2, theta)
-    H = (H+H.T)/2
-    J = jacobian(loss_from_theta3, theta)
 
-    V = torch.linalg.inv(H)
-    V2 = torch.linalg.inv((J.T@J))
-    V3 = torch.linalg.inv((H + J.T@J)/2)
+    out = {}
 
-    ## Output
-    return [[{'min_eigenvalue':np.min(torch.linalg.eig(V).eigenvalues.cpu().numpy().astype(float)),'H':H.detach().cpu().numpy(),'V':V.detach().cpu().numpy()},{name+"_ste":np.sqrt(x.detach().cpu().numpy()) for x,name in zip(unpack_theta(torch.diag(V), param_shapes), ['beta', 'lambd1', 'lambd2', 'b', 'phi', 'sigma_lt'])}],
- [{'min_eigenvalue':np.min(torch.linalg.eig(V2).eigenvalues.cpu().numpy().astype(float)),'V':V2.detach().cpu().numpy()},{name+"_ste":np.sqrt(x.detach().cpu().numpy()) for x,name in zip(unpack_theta(torch.diag(V2), param_shapes), ['beta', 'lambd1', 'lambd2', 'b', 'phi', 'sigma_lt'])}],
- [{'min_eigenvalue':np.min(torch.linalg.eig(V3).eigenvalues.cpu().numpy().astype(float)),'V':V3.detach().cpu().numpy()},{name+"_ste":np.sqrt(x.detach().cpu().numpy()) for x,name in zip(unpack_theta(torch.diag(V3), param_shapes), ['beta', 'lambd1', 'lambd2', 'b', 'phi', 'sigma_lt'])}]]
+    if compute_hessian:
+        H = hessian(loss_from_theta2, theta)
+        H = (H+H.T)/2 
+        V = torch.linalg.inv(H + reg*np.eye(H.shape[0]))
+        out["H"] = [{'min_eigenvalue':np.min(torch.linalg.eig(V).eigenvalues.cpu().numpy().astype(float)),'H':H.detach().cpu().numpy(),'V':V.detach().cpu().numpy()},{name+"_ste":np.sqrt(x.detach().cpu().numpy()) for x,name in zip(unpack_theta(torch.diag(V), param_shapes), ['beta', 'lambd1', 'lambd2', 'b', 'phi', 'sigma_lt'])}]
     
+    J = jacobian(loss_from_theta3, theta)
+    V2 = torch.linalg.inv(J.T@J + reg*np.eye(J.T.shape[0]))
+    out["J"] = [{'min_eigenvalue':np.min(torch.linalg.eig(V2).eigenvalues.cpu().numpy().astype(float)),'V':V2.detach().cpu().numpy()},{name+"_ste":np.sqrt(x.detach().cpu().numpy()) for x,name in zip(unpack_theta(torch.diag(V2), param_shapes), ['beta', 'lambd1', 'lambd2', 'b', 'phi', 'sigma_lt'])}]
+    
+    ## Output
+    return out
+
+# Sampling
 def SampleParams(beta, b, phi, lambd1, lambd2, sigma, cov, n=100):
+
+    """
+    Draw `n` parameter realizations from the asymptotic Normal approximation
+    around the MLE.
+ 
+    Parameters are packed via `pack_theta`, sampled jointly from
+    N(theta_hat, cov), then unpacked. Each draw of sigma is projected onto
+    the PSD cone (eigenvalues clipped at 0) and a small diagonal
+    regularization (1e-4) is added; phi entries below the same threshold are
+    also clipped up to keep dispersions positive.
+ 
+    Parameters
+    ----------
+    beta, b, phi, lambd1, lambd2 : np.ndarray
+        Point estimates of the corresponding parameters.
+    sigma : np.ndarray, shape (K, K)
+        Point estimate of the random-effects covariance / correlation matrix.
+    cov : np.ndarray
+        Asymptotic covariance matrix of the packed parameter vector (e.g.
+        V_H or V_J from `GetAsymptVar`).
+    n : int, default 100
+        Number of draws.
+ 
+    Returns
+    -------
+    tuple of lists
+        (betas, bs, phis, lambds, sigmas) each of length n. `lambds[i]` is
+        the reconstructed (K, J) loading matrix and `sigmas[i]` is the
+        PSD-projected covariance matrix for draw i.
+    """
+    
     sigma_lt = extract_lower_triangle(sigma)
     mu = pack_theta(torch.tensor(beta), torch.tensor(lambd1), torch.tensor(lambd2), torch.tensor(b), torch.tensor(phi), torch.tensor(sigma_lt)).numpy()
     param_shapes = (beta.shape, lambd1.shape, lambd2.shape, b.shape, phi.shape, sigma_lt.shape)
     thetas = np.random.multivariate_normal(mu, cov, size=n)
-    thetas = [{name:x.detach().cpu().numpy() for x,name in zip(unpack_theta(torch.tensor(t), param_shapes), ['beta', 'lambd1', 'lambd2', 'b', 'phi', 'sigma_lt'])} for t in thetas]
+    thetas = [{name:x.detach().cpu().numpy() for x, name in zip(unpack_theta(torch.tensor(t), param_shapes), ['beta', 'lambd1', 'lambd2', 'b', 'phi', 'sigma_lt'])} for t in thetas]
     
     betas=[]
     bs=[]
@@ -973,7 +1137,158 @@ def SampleParams(beta, b, phi, lambd1, lambd2, sigma, cov, n=100):
         sigmas.append(sigma)
 
     return betas, bs, phis, lambds, sigmas
+
+def log_like_fe(X, Y, D, C, A, beta, lambd, b, phi):
+
+    """
+    Conditional ("fixed-effects" form) log-likelihood given the latent A.
+ 
+    Same Beta likelihood as `log_like`, but with the family-level random
+    effects A treated as known rather than integrated out. Used inside
+    `joint_dist_one_fam` for posterior inference / MCMC over A. NaN entries
+    in Y contribute zero.
+ 
+    Parameters
+    ----------
+    X : (n, p) tensor
+    Y : (n, J) tensor
+    D : (n, F) tensor
+        Family-indicator matrix, used to attribute each row's random effect.
+    C : (J,) tensor
+        Per-outcome floor.
+    A : (F, K) tensor
+        Family-level random effects (treated as fixed).
+    beta : (p, K) tensor
+    lambd : (K, J) tensor
+    b : (1, J) tensor
+    phi : (1, J) tensor
+        Per-outcome dispersion (positive).
+ 
+    Returns
+    -------
+    torch.Tensor
+        Scalar conditional log-likelihood, summed over observations and
+        outcomes.
+ 
+    Notes
+    -----
+    This function references a bare name `eps` (used inside
+    `mu.clamp(min=eps, max=1.0 - eps)`) that is not a parameter and not
+    defined locally — it must be defined in the enclosing scope at call
+    time.
+    """
     
+    mu = C+(1-C)*sigmoid((X@beta+D@A)@lambd+b)
+    mu = mu.clamp(min=eps, max=1.0 - eps)  
+    beta_dist = Beta(phi*mu, phi*(1-mu))
+
+    nan_mask = torch.isnan(Y) #dealing with missing values
+    Y_clipped = torch.where(nan_mask, torch.full_like(Y, 0.5), Y)
+    ll_terms = beta_dist.log_prob(Y_clipped[None, :])
+    loglike = torch.where(nan_mask, torch.zeros_like(ll_terms), ll_terms).sum()
+    return loglike
+    
+def joint_dist_one_fam(X, Y, C, A, beta, lambd, b, phi, sigma, device='cpu'):
+
+    """
+    Unnormalized log-posterior of A for a single family.
+ 
+    Combines the conditional log-likelihood (`log_like_fe`) with the Gaussian
+    prior log p(A | sigma) = MVN(0, sigma) and returns their sum, i.e. the
+    target log-density for posterior inference on a single family's random
+    effect. The data passed in should already be filtered to that family
+    (so D is implicitly the 1x1 identity here).
+ 
+    Parameters
+    ----------
+    X, Y : tensors
+        Family-restricted covariates and outcomes.
+    C : (J,) tensor
+        Per-outcome floor.
+    A : (K,) tensor
+        Random-effect vector for this family.
+    beta, lambd, b, phi : tensors
+        Population-level parameters.
+    sigma : (K, K) tensor
+        Prior covariance of A.
+    device : str, default 'cpu'
+        Device on which to evaluate.
+ 
+    Returns
+    -------
+    torch.Tensor
+        Scalar log p(Y_fam, A | params, sigma).
+    """
+    
+    D = torch.eye(1).to(device)
+    prior = torch.distributions.MultivariateNormal(
+        torch.zeros(A.squeeze().shape[0], device=device),
+        covariance_matrix=sigma.to(device)
+    )
+    return log_like_fe(X.to(device), Y.to(device), D.to(device), C.to(device), A.to(device).squeeze()[None,:], beta.to(device), lambd.to(device), b.to(device), phi.to(device)) + prior.log_prob(A.to(device).squeeze()).to(device)
+
+def metropolis_hastings(init,
+                        sigma_prop,
+                        X_tensor,
+                        Y_tensor,
+                        C_tensor,
+                        beta_tensor,
+                        lambd_tensor,
+                        b_tensor,
+                        phi_tensor,
+                        sigma_tensor,
+                        n_samples=2000,
+                        burn_in=100,
+                        thinning=10):
+    
+    """
+    Perform Metropolis-Hastings sampling in the log domain using PyTorch with thinning.
+    
+    Parameters:
+    - init: torch.Tensor, initial state of the chain.
+    - sigma: torch.Tensor, covariance matrix for the Gaussian proposal distribution.
+    - n_samples: int, number of samples to draw after burn-in.
+    - burn_in: int, number of initial samples to discard.
+    - thinning: int, interval at which to keep samples (e.g., 2 keeps every second sample).
+    
+    Returns:
+    - samples: torch.Tensor of shape (n_samples, d), sampled points.
+    """
+    
+    def log_density(A):
+        return joint_dist_one_fam(X_tensor, Y_tensor, C_tensor, 
+                                  A, beta_tensor, lambd_tensor, 
+                                  b_tensor, phi_tensor, sigma_tensor)
+    
+    d = len(init)
+    samples = torch.zeros((n_samples, d), dtype=init.dtype, device=init.device)
+    current = init.clone()
+    current_log_density = log_density(current)
+    
+    cov_chol = torch.linalg.cholesky(sigma_prop)  # Cholesky decomposition for efficient sampling
+    
+    collected = 0
+    i = 0
+    while collected < n_samples:
+        for _ in range(thinning):
+            proposal = current + cov_chol @ torch.randn(d, dtype=init.dtype, device=init.device)
+            proposal_log_density = log_density(proposal)
+            
+            # Compute log acceptance probability
+            log_alpha = proposal_log_density - current_log_density
+            
+            if torch.log(torch.rand((), dtype=init.dtype, device=init.device)) < log_alpha:
+                current = proposal
+                current_log_density = proposal_log_density
+        
+        if i >= burn_in:
+            samples[collected] = current
+            collected += 1
+        i += 1
+    
+    return samples
+
+
 def SampleAlpha(i,
                  betas,
                  lambds,
@@ -991,6 +1306,60 @@ def SampleAlpha(i,
                  burn_in=100,
                  thinning=30,
                  return_map=False):
+
+    """
+    Sample the latent random effect A for one family, using a Laplace-aided
+    Metropolis-Hastings scheme.
+ 
+    The procedure is:
+        1. Restrict the data to the family identified by `fam_number`.
+        2. Find the MAP of A by minimizing the negative joint log-density
+           with LBFGS (strong-Wolfe line search), starting from zero.
+        3. Approximate the posterior curvature by the inverse Hessian of the
+           negative log-density at the MAP (Laplace covariance).
+        4. Either return the MAP directly (`return_map=True`) or run
+           `metropolis_hastings` with proposal covariance equal to the
+           Laplace covariance.
+ 
+    Parameter samples (`betas`, `lambds`, `bs`, `phis`, `sigmas`) are
+    typically drawn from `SampleParams`, so that posterior uncertainty in A
+    can be propagated together with parameter uncertainty.
+ 
+    Parameters
+    ----------
+    i : int
+        Index into the parameter sample lists; selects which posterior draw
+        of the population parameters to condition on.
+    betas, lambds, bs, phis, sigmas : lists of array-likes
+        Posterior draws of the population parameters (one entry per draw).
+    D : array-like, shape (n, F)
+        Family-indicator matrix for the full dataset.
+    fam_number : int
+        Column index of D selecting the family to sample.
+    X, Y : array-likes
+        Full-dataset covariates and outcomes.
+    C : array-like
+        Per-outcome floor.
+    K : int
+        Latent dimension of A.
+    random_seed : int, default 42
+        Seed for reproducibility.
+    n_samples : int, default 10
+        Number of post-burn-in MH samples to return.
+    burn_in : int, default 100
+        MH burn-in.
+    thinning : int, default 30
+        MH thinning interval.
+    return_map : bool, default False
+        If True, skip MH and return only the MAP estimate (as a torch.Tensor).
+ 
+    Returns
+    -------
+    np.ndarray of shape (n_samples, K)
+        Posterior draws of A for the selected family (when `return_map=False`).
+    torch.Tensor of shape (K,)
+        MAP estimate of A (when `return_map=True`).
+    """
     
     torch.manual_seed(random_seed)
     
