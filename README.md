@@ -1,6 +1,6 @@
 # Statistical Scaling Law for LLM Skills
 
-This repository contains the code and data that accompany the paper described in the prompt. The project builds a latent-variable scaling model to study how large language model (LLM) capabilities grow with compute across diverse model families and benchmarks. It provides utilities to fit the model, sample family-level abilities, and reproduce the empirical studies reported in the paper.
+This project builds a latent-variable scaling model to study how large language model (LLM) capabilities grow with compute across diverse model families and benchmarks. It provides utilities to fit the model, sample family-level abilities, and reproduce the empirical studies reported in the paper.
 
 ## Repository structure
 
